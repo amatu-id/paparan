@@ -44,6 +44,10 @@ export function toNumber(n, loc = 'id') {
   else if (dots === 1 && n.split('.')[1].length !== 3) dec = '.';
   else if (commas === 1 && n.split(',')[1].length !== 3) dec = ',';
   const th = dec === ',' ? '.' : ',';
+  // thousands groups must be exactly three digits ("3,000,3,000,000" is an OCR mistake, not a number)
+  const intPart = n.split(dec)[0];
+  if (intPart.includes(th)) { const g = intPart.split(th); if (g[0].length > 3 || !g[0].length || g.slice(1).some(x => x.length !== 3)) return null; }
+  if (n.split(dec).length > 2) return null;
   const v = +n.split(th).join('').replace(dec, '.');
   return Number.isFinite(v) ? v : null;
 }
@@ -52,6 +56,10 @@ export function toNumber(n, loc = 'id') {
 export function parseNum(raw, loc = 'id') {
   if (typeof raw === 'number') return Number.isFinite(raw) ? { v: raw, unit: '', kind: 'num' } : null;
   let s = String(raw ?? '').trim();
+  // OCR leftovers around a cell value: "[123", "25.88%.", "Rp 85,070,477]"
+  s = s.replace(/^[\[|{'"`‘’“”]+/, '').replace(/[\]|}'"`‘’“”:;!]+$/, '').replace(/(%)\.+$/, '$1').trim();
+  if (/^\(/.test(s) && !/\)$/.test(s)) s = s.slice(1).trim();
+  if (/\)$/.test(s) && !/^\(/.test(s) && !/\(/.test(s)) s = s.slice(0, -1).trim();
   if (!s || s.length > 40) return null;
   if (/^[-–—]+$/.test(s)) return null;
   if (/^\d{1,2}[:.]\d{2}([:.]\d{2})?$/.test(s) && /:/.test(s)) return null;               // 08:30
@@ -67,7 +75,10 @@ export function parseNum(raw, loc = 'id') {
   if (s[0] === '-') { neg = !neg; s = s.slice(1).trim(); }
   let m = /^(\d[\d.,\s ]*\d|\d)\s*(.*)$/.exec(s);
   if (!m) return null;
-  let v = toNumber(m[1].replace(/[\s ]/g, ''), loc);
+  let t = m[1];
+  // "3,000 000 000" (a space read instead of a separator): a space before a 3-digit group is a thousands separator
+  if (/[\s\u00a0]/.test(t)) { const sep = /\.\d{3}/.test(t) && !/,\d{3}/.test(t) ? '.' : /,\d{3}/.test(t) ? ',' : loc === 'en' ? ',' : '.'; t = t.replace(/[\s\u00a0]+(?=\d{3}(?:\D|$))/g, sep); }
+  let v = toNumber(t.replace(/[\s\u00a0]/g, ''), loc);
   if (v == null) return null;
   let rest = m[2].trim().toLowerCase().replace(/\.$/, '');
   if (rest === '%' || rest === 'persen' || rest === 'pct') { unit = '%'; kind = 'pct'; rest = ''; }

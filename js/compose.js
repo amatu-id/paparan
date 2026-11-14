@@ -97,7 +97,14 @@ export function composeSlide(s, idx, total, spec, th) {
       rect(x, y0, 6, ch, i === 0 ? C.a1 : mix(C.a1, C.bg, 0.35 + 0.12 * i), { r: 3 });
       const v = text(x + 24, y0 + 22, cw - 44, ch * 0.42, k.v || '–', { font: 'head', weight: 800, max: n <= 2 ? 52 : n === 3 ? 44 : 38, min: 18, lh: 1.05, color: C.a1, maxLines: 1 });
       const lab = text(x + 24, y0 + 26 + v.used + 8, cw - 44, ch * 0.3, k.label || '', { max: 16.5, min: 10.5, weight: 700, color: C.title, maxLines: 2, bind: { f: 'kpis', i, p: 'label' } });
-      if (k.note) text(x + 24, y0 + 26 + v.used + 10 + lab.used + 4, cw - 44, Math.max(14, ch - (26 + v.used + 14 + lab.used) - 14), k.note, { max: 13.5, min: 9.5, color: C.tx2, maxLines: 2, bind: { f: 'kpis', i, p: 'note' } });
+      const hasBar = k.pct != null && Number.isFinite(+k.pct);
+      if (k.note) text(x + 24, y0 + 26 + v.used + 10 + lab.used + 4, cw - 44, Math.max(14, ch - (26 + v.used + 14 + lab.used) - (hasBar ? 34 : 14)), k.note, { max: 13.5, min: 9.5, color: C.tx2, maxLines: 2, bind: { f: 'kpis', i, p: 'note' } });
+      if (hasBar) {
+        // progress toward 100% (the target): the percentage made visible
+        const bw = cw - 48, by = y0 + ch - 24, f = Math.max(0, Math.min(100, +k.pct)) / 100;
+        rect(x + 24, by, bw, 8, C.line, { r: 4 });
+        if (f > 0) rect(x + 24, by, Math.max(8, bw * f), 8, +k.pct >= 100 ? C.a2 : C.a1, { r: 4 });
+      }
     });
     if (pts.length) bullets(M, y0 + ch + 26, W - 2 * M, H - 64 - (y0 + ch + 26), pts.slice(0, 4), { max: 18, min: 11, marker: 'check', bind: { f: 'points' } });
     footer();

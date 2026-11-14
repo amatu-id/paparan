@@ -321,6 +321,9 @@ h3.tvh { font-size: 19px; } h4.tvh { font-size: 15.5px; }
 .dbar-l select { min-width: 0; max-width: 100%; flex: 0 1 auto; text-overflow: ellipsis; }
 .dbar-r { flex-wrap: wrap; }
 .deck-b { flex: 1; min-height: 0; display: flex; }
+.stale { display: flex; align-items: center; gap: 10px; margin: 8px 16px 0; padding: 9px 12px; border-radius: 12px; background: var(--acbg); color: var(--tx); font-size: 13px; }
+.stale .ic { color: var(--ac); }
+.stale span { flex: 1; }
 .thumbs { width: 198px; flex: none; overflow-y: auto; overflow-x: hidden; padding: 12px 10px 20px 14px; display: flex; flex-direction: column; gap: 10px; border-right: 1px solid var(--line); }
 .th { position: relative; border: 0; padding: 0 0 0 20px; background: transparent; text-align: left; }
 .thn { position: absolute; left: 0; top: 2px; font-size: 11px; font-weight: 700; color: var(--tx3); width: 16px; text-align: right; }

@@ -1,7 +1,7 @@
 // Amatu Paparan — app shell: library, upload, document tabs (Lihat / Ringkasan / Paparan), Q&A panel.
 import { DB } from './db.js';
 import { ACCEPT, kindOf } from './extract.js';
-import { learn, deepen, loadDoc, facts, forget, device, lockName } from './learn.js';
+import { learn, deepen, loadDoc, facts, forget, device, lockName, reread, CONTENT_V } from './learn.js';
 import { ask } from './qa.js';
 import { md } from './md.js';
 import { Viewer } from './viewer.js';
@@ -81,6 +81,7 @@ async function route() {
   if (changed) { S.scope = 'doc'; await renderDoc(); renderChat(); }
   showTab(tab, deckId);
   nav();
+  if (changed) maybeReread(meta);
 }
 addEventListener('popstate', route);
 
@@ -220,6 +221,7 @@ async function renderDoc() {
     h('button', { role: 'tab', class: 'tab', dataset: { t }, onclick: () => go(d.id, t) }, icon(ic), h('span', null, l))));
   const actions = h('div', { class: 'dact' },
     d.status === 'siap' && !d.ai ? h('button', { class: 'btn sm', title: 'Pelajari ulang dengan AI', onclick: () => relearn(d) }, icon('spark'), h('span', { class: 'hide-s' }, 'Pelajari dengan AI')) : null,
+    d.status === 'siap' || d.status === 'gagal' ? h('button', { class: 'ib', title: 'Baca ulang dokumen (termasuk tabel & angka di dalam gambar)', 'aria-label': 'Baca ulang dokumen', onclick: () => rereadDoc(d) }, icon('refresh')) : null,
     h('button', { class: 'ib', title: 'Unduh file asli', 'aria-label': 'Unduh file asli', onclick: async () => { const f = await DB.get('files', d.id); if (f?.blob) download(f.blob, d.name); else toast('File asli tidak ada di perangkat ini'); } }, icon('download')),
     h('button', { class: 'ib', title: 'Hapus dokumen', 'aria-label': 'Hapus dokumen', onclick: () => removeDoc(d) }, icon('trash')));
   const head = h('div', { class: 'dhead' }, kindIcon(d), h('div', { class: 'dtitle' }, h('h2', null, d.digest?.title || d.name), h('span', null, [d.name !== (d.digest?.title || d.name) ? d.name : '', KIND[d.kind]?.[0], d.pages > 1 ? `${d.pages} ${d.kind === 'sheet' ? 'sheet' : d.kind === 'pptx' ? 'slide' : 'halaman'}` : '', d.tables ? `${d.tables} tabel` : '', fmtBytes(d.size)].filter(Boolean).join(' · '))), actions);
@@ -276,6 +278,32 @@ async function retry(d) {
   await loadDocs();
   go(null);
   upload([file]);
+}
+// read the stored file again with the current reader; automatic once for documents learned by an older version
+async function rereadDoc(d, auto) {
+  if (S.busy && auto) return;
+  S.prog[d.id] = { v: 0.02, t: 'Membaca ulang dokumen' };
+  S.busy++;
+  try {
+    S.cur = { ...d, status: 'baca' };
+    await renderDoc(); progressDoc();
+    await reread(d.id, (v, t) => { S.prog[d.id] = { v, t }; if (S.cur?.id === d.id) progressDoc(); renderLibSoon(); });
+    toast(auto ? 'Dokumen dibaca ulang: tabel & angka di dalam gambar kini ikut dipelajari' : 'Dokumen selesai dibaca ulang', 'ok', 6000);
+  } catch (e) { toast('Gagal membaca ulang: ' + (e.message || e), 'err', 6000); }
+  finally {
+    S.busy--; delete S.prog[d.id];
+    forget(d.id);
+    await loadDocs(); S.cur = S.docs.find(x => x.id === d.id) || S.cur;
+    renderLib(); if (S.cur?.id === d.id) { await renderDoc(); showTab(S.tab); renderChat(); }
+  }
+}
+async function maybeReread(d) {
+  if (!d || d.status !== 'siap' || (d.cv || 1) >= CONTENT_V || S.reread?.has(d.id)) return;
+  if (!/^(pdf|docx|pptx|odt|odp|image)$/.test(d.kind)) return;
+  (S.reread ||= new Set()).add(d.id);
+  const f = await DB.get('files', d.id);
+  if (!f?.blob) return;
+  rereadDoc(d, true);
 }
 async function relearn(d) {
   if (!AI.ok()) return toast(AI.message(), 'err', 6000);

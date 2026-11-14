@@ -114,7 +114,10 @@ export class DeckView {
         h('button', { class: 'ib', title: 'Geser ke bawah', 'aria-label': 'Geser slide ke bawah', onclick: () => this.move(1) }, icon('down')),
         h('button', { class: 'ib', title: 'Hapus slide', 'aria-label': 'Hapus slide', onclick: () => this.delSlide() }, icon('trash'))));
     const info = sp.dropped?.length ? h('div', { class: 'vnote' }, `${sp.dropped.length} kalimat berisi angka yang tidak ditemukan di dokumen telah dibuang agar paparan tetap akurat.`) : null;
-    this.host.replaceChildren(h('div', { class: 'deck' }, bar, h('div', { class: 'deck-b' }, this.thumbs, h('div', { class: 'deck-m' }, this.stage, tools, this.notes, info))));
+    const why = sp.source !== 'ai' ? h('div', { class: 'stale' }, icon('spark'), h('span', null, sp.aiErr === 'kuota' ? 'Disusun tanpa AI: kuota AI harian habis (pulih 07.00 WIB).' : sp.aiErr === 'auth' ? 'Disusun tanpa AI: masuk ke Portal AMATU untuk memakai AI.' : 'Disusun tanpa AI karena AI sedang sibuk. Coba lagi untuk judul & narasi yang lebih tajam.'), AI.ok() ? h('button', { class: 'btn sm primary', onclick: () => this.generate({ ...deck.opts }) }, 'Coba lagi dengan AI') : null) : null;
+    // the document was read again after this deck was made (e.g. tables inside pictures are now read)
+    const stale = this.meta.learned && deck.created < this.meta.learned ? h('div', { class: 'stale' }, icon('refresh'), h('span', null, 'Dokumen sudah dibaca ulang dengan data yang lebih lengkap. Buat ulang paparan agar angka & grafik terbaru ikut tampil.'), h('button', { class: 'btn sm primary', onclick: () => this.generate({ ...deck.opts }) }, 'Buat ulang paparan')) : null;
+    this.host.replaceChildren(h('div', { class: 'deck' }, bar, stale || why, h('div', { class: 'deck-b' }, this.thumbs, h('div', { class: 'deck-m' }, this.stage, tools, this.notes, info))));
     this.renderThumbs();
     this.go(this.idx);
     this.ro?.disconnect();

@@ -62,8 +62,11 @@ export async function extract(file, prog = () => { }) {
   else throw new Error('Jenis file ini belum didukung');
   c.meta ||= {};
   c.meta.lang = detectLang(c);
+  c.v = CONTENT_V;
   return c;
 }
+// bump when the reader learns something new, so older documents are read again
+export const CONTENT_V = 3;
 
 // ---------- language ----------
 const IDW = new Set('yang dan di ke dari untuk dengan pada ini itu adalah dalam tidak akan juga atau oleh sebagai bulan tahun telah sudah karena agar serta tersebut maka bahwa dapat lebih jumlah hasil setiap kami kita'.split(' '));
@@ -85,7 +88,8 @@ async function extractPdf(file, prog) {
     if (md?.info) { D.meta.title = md.info.Title || ''; D.meta.author = md.info.Author || ''; }
     const pages = [];
     const n = pdf.numPages;
-    let scanned = 0;
+    let scanned = 0, imgs = 0;
+    const imgBudget = { n: 0 };
     for (let p = 1; p <= n; p++) {
       prog((p - 1) / n * 0.9, `Membaca halaman ${p} dari ${n}`);
       const page = await pdf.getPage(p);
@@ -101,14 +105,13 @@ async function extractPdf(file, prog) {
         res = await ocrPage(page, vp);
       } else {
         const fonts = {};
-        if (p <= 60) {
-          try {
-            await page.getOperatorList();
-            for (const it of tc.items) if (it.fontName && !(it.fontName in fonts) && page.commonObjs.has(it.fontName)) {
-              const f = page.commonObjs.get(it.fontName);
-              fonts[it.fontName] = !!(f && (f.bold || f.black || /bold|black|heavy|semibold|demi/i.test(f.name || '')));
-            }
-          } catch { }
+        let ops = null;
+        try { ops = await page.getOperatorList(); } catch { }
+        if (ops && p <= 60) {
+          for (const it of tc.items) if (it.fontName && !(it.fontName in fonts) && page.commonObjs.has(it.fontName)) {
+            const f = page.commonObjs.get(it.fontName);
+            fonts[it.fontName] = !!(f && (f.bold || f.black || /bold|black|heavy|semibold|demi/i.test(f.name || '')));
+          }
         }
         const items = [];
         for (const it of tc.items) {
@@ -119,6 +122,19 @@ async function extractPdf(file, prog) {
           items.push({ s: it.str, x: tx[4], y: tx[5], w: Math.abs(it.width) * vp.scale, h: fh, b: fonts[it.fontName] });
         }
         res = pageBlocks(items, vp.width, vp.height);
+        // pictures on the page (screenshots of tables, scanned attachments): read them too
+        const pics = ops ? imageBoxes(lib, ops, vp).filter(b => b.w * b.h >= 0.03 * vp.width * vp.height && b.w >= 90 && b.h >= 40) : [];
+        for (const [k, b] of pics.entries()) {
+          if (imgBudget.n >= MAX_IMG) break;
+          imgBudget.n++;
+          prog((p - 1) / n * 0.9, `Membaca isi gambar ${k + 1} dari ${pics.length} di halaman ${p} (tabel/angka)`);
+          try {
+            const cv = (b.id && b.upright && await nativeCanvas(page, b.id)) || await regionCanvas(page, b);
+            const sub = await ocrCanvas(cv, { clean: true });
+            cv.width = cv.height = 0;
+            if (sub.blocks.length) { mergeRegion(res, sub, b, vp.width, vp.height); imgs++; }
+          } catch (e) { console.warn('ocr picture', e); }
+        }
       }
       pages.push({ ...res, w: vp.width, h: vp.height });
       page.cleanup();
@@ -126,21 +142,119 @@ async function extractPdf(file, prog) {
     }
     const furn = furnitureKeys(pages);
     // heading levels across the whole document (a page without the big title must not promote its sections)
-    const hs = [...new Set(pages.flatMap(pg => pg.blocks.filter(b => b.t === 'h' && b.rel > 1.12).map(b => b.fs)))].sort((a, b) => b - a);
+    const hs = [...new Set(pages.flatMap(pg => pg.blocks.filter(b => b.t === 'h' && !b.img && b.rel > 1.12).map(b => b.fs)))].sort((a, b) => b - a);
     pages.forEach((pg, k) => {
       const u = D.unit('Hal. ' + (k + 1), { w: Math.round(pg.w), h: Math.round(pg.h) });
       for (const b of pg.blocks) {
-        if (b.t === 'tbl') { addPdfTable(D, { ...pg.tables[b.ti] }, u); continue; }
-        if (furn.has(norm(b.x))) continue;
+        if (b.t === 'tbl') { const tb = { ...pg.tables[b.ti] }; if (tb.img) D.table(tb, u); else addPdfTable(D, tb, u); continue; }
+        if (!b.img && furn.has(norm(b.x))) continue;
         if (/^(halaman|page|hal\.?)?\s*\d+(\s*(dari|of|\/)\s*\d+)?$/i.test(b.x.trim())) continue;   // page numbers
-        const lv = b.t === 'h' ? (b.rel > 1.12 ? Math.min(3, hs.indexOf(b.fs) + 1 || 3) : 3) : 0;
+        const lv = b.t === 'h' ? (b.img ? 3 : b.rel > 1.12 ? Math.min(3, hs.indexOf(b.fs) + 1 || 3) : 3) : 0;
         D.add(b.t, b.x, u, { r: b.r, ...(lv ? { lv } : {}) });
       }
     });
     D.meta.pages = n;
     if (scanned) D.meta.ocr = scanned;
+    if (imgs) D.meta.imgs = imgs;
   } finally { pdf.destroy(); }
   return D.out();
+}
+
+// ---------- pictures inside pages ----------
+export const MAX_IMG = 24;          // pictures read with OCR per document (time)
+// where images are painted on a page, in viewport units (scale 1)
+function imageBoxes(lib, ops, vp) {
+  const { OPS, Util } = lib;
+  let ctm = [1, 0, 0, 1, 0, 0];
+  const stack = [], out = [];
+  const paint = new Set([OPS.paintImageXObject, OPS.paintInlineImageXObject, OPS.paintImageXObjectRepeat, OPS.paintJpegXObject].filter(x => x != null));
+  for (let i = 0; i < ops.fnArray.length; i++) {
+    const fn = ops.fnArray[i], a = ops.argsArray[i];
+    if (fn === OPS.save) stack.push(ctm);
+    else if (fn === OPS.restore) ctm = stack.pop() || [1, 0, 0, 1, 0, 0];
+    else if (fn === OPS.transform) ctm = Util.transform(ctm, a);
+    else if (fn === OPS.paintFormXObjectBegin) { stack.push(ctm); if (Array.isArray(a?.[0]) && a[0].length === 6) ctm = Util.transform(ctm, a[0]); }
+    else if (fn === OPS.paintFormXObjectEnd) ctm = stack.pop() || [1, 0, 0, 1, 0, 0];
+    else if (paint.has(fn)) {
+      const m = Util.transform(vp.transform, ctm);
+      const pts = [[0, 0], [1, 0], [0, 1], [1, 1]].map(q => Util.applyTransform(q, m));
+      const xs = pts.map(q => q[0]), ys = pts.map(q => q[1]);
+      const x = Math.max(0, Math.min(...xs)), y = Math.max(0, Math.min(...ys));
+      const w = Math.min(vp.width, Math.max(...xs)) - x, h = Math.min(vp.height, Math.max(...ys)) - y;
+      // upright, unflipped placement: the stored picture can be read as it is
+      const upright = m[0] > 0 && m[3] < 0 && Math.abs(m[1]) < 1e-6 && Math.abs(m[2]) < 1e-6;
+      if (w > 1 && h > 1) out.push({ x, y, w, h, id: typeof a?.[0] === 'string' ? a[0] : null, upright });
+    }
+  }
+  return out.filter((b, i) => !out.slice(0, i).some(o => Math.abs(o.x - b.x) < 2 && Math.abs(o.y - b.y) < 2 && Math.abs(o.w - b.w) < 3));
+}
+// the picture as stored in the PDF (sharper than re-rendering the page), scaled like a picture file
+async function nativeCanvas(page, id) {
+  const store = id.startsWith('g_') ? page.commonObjs : page.objs;
+  const img = await new Promise(res => {
+    const t = setTimeout(() => res(null), 6000);
+    try { if (store.has(id)) { clearTimeout(t); res(store.get(id)); } else store.get(id, v => { clearTimeout(t); res(v); }); } catch { clearTimeout(t); res(null); }
+  });
+  if (!img || !img.width || !img.height || img.width < 300 || img.height < 80) return null;
+  let src = img.bitmap || null;
+  if (!src && img.data) {
+    const n = img.width * img.height, rgba = new Uint8ClampedArray(n * 4), dd = img.data;
+    if (dd.length === n * 4) rgba.set(dd);
+    else if (dd.length === n * 3) for (let i = 0, j = 0; i < n; i++, j += 3) { rgba[i * 4] = dd[j]; rgba[i * 4 + 1] = dd[j + 1]; rgba[i * 4 + 2] = dd[j + 2]; rgba[i * 4 + 3] = 255; }
+    else return null;
+    const c0 = document.createElement('canvas');
+    c0.width = img.width; c0.height = img.height;
+    c0.getContext('2d').putImageData(new ImageData(rgba, img.width, img.height), 0, 0);
+    src = c0;
+  }
+  if (!src) return null;
+  const k = Math.min(3, Math.max(1, 3200 / img.width));
+  const kk = img.width * img.height * k * k > 14e6 ? Math.sqrt(14e6 / (img.width * img.height)) : k;
+  const cv = document.createElement('canvas');
+  cv.width = Math.round(img.width * kk); cv.height = Math.round(img.height * kk);
+  const g = cv.getContext('2d', { willReadFrequently: true });
+  g.fillStyle = '#fff'; g.fillRect(0, 0, cv.width, cv.height);
+  g.drawImage(src, 0, 0, cv.width, cv.height);
+  return cv;
+}
+// one region of a page rendered sharp enough for OCR (≈3200 px wide: small table text reads far better; capped for phones)
+async function regionCanvas(page, b) {
+  let scale = Math.min(7.5, 3200 / b.w);
+  if (b.w * b.h * scale * scale > 14e6) scale = Math.sqrt(14e6 / (b.w * b.h));
+  const vp = page.getViewport({ scale, offsetX: -b.x * scale, offsetY: -b.y * scale });
+  const cv = document.createElement('canvas');
+  cv.width = Math.max(1, Math.round(b.w * scale)); cv.height = Math.max(1, Math.round(b.h * scale));
+  const g = cv.getContext('2d', { willReadFrequently: true });
+  g.fillStyle = '#fff'; g.fillRect(0, 0, cv.width, cv.height);
+  await page.render({ canvasContext: g, viewport: vp }).promise;
+  return cv;
+}
+// OCR result of a region → into the page's reading order, rectangles back in page units
+function mergeRegion(res, sub, b, W, H) {
+  const off = res.tables.length;
+  const conv = r => [+((b.x + r[0] * b.w) / W).toFixed(4), +((b.y + r[1] * b.h) / H).toFixed(4), +(r[2] * b.w / W).toFixed(4), +(r[3] * b.h / H).toFixed(4)];
+  for (const t of sub.tables) res.tables.push({ ...t, r: t.r ? conv(t.r) : undefined, img: 1 });
+  const add = sub.blocks.map(x => ({ ...x, ti: x.t === 'tbl' ? x.ti + off : x.ti, r: x.r ? x.r.map(conv) : undefined, img: 1, fs: undefined, rel: undefined }));
+  const top = b.y / H;
+  let at = res.blocks.findIndex(x => x.r && x.r[0] && x.r[0][1] > top);
+  if (at < 0) at = res.blocks.length;
+  res.blocks.splice(at, 0, ...add);
+}
+// a picture file (Word / PowerPoint media) → blocks + tables
+export async function ocrImageBlob(blob, o = {}) {
+  let bmp;
+  try { bmp = await createImageBitmap(blob); } catch { return null; }
+  if (bmp.width < 300 || bmp.height < 100) return null;
+  const k = Math.min(3, Math.max(1, 3200 / bmp.width));
+  const kk = bmp.width * bmp.height * k * k > 14e6 ? Math.sqrt(14e6 / (bmp.width * bmp.height)) : k;
+  const cv = document.createElement('canvas');
+  cv.width = Math.round(bmp.width * kk); cv.height = Math.round(bmp.height * kk);
+  const g = cv.getContext('2d', { willReadFrequently: true });
+  g.fillStyle = '#fff'; g.fillRect(0, 0, cv.width, cv.height);
+  g.drawImage(bmp, 0, 0, cv.width, cv.height);
+  const r = await ocrCanvas(cv, { clean: true, ...o });
+  cv.width = cv.height = 0;
+  return r.blocks.length ? r : null;
 }
 
 // A table that runs on to the next page continues the previous one: same columns, nothing in between,
@@ -178,8 +292,66 @@ async function ocrPage(page, vp) {
   return r;
 }
 
-export async function ocrCanvas(cv) {
+// Screenshots of spreadsheets: grid lines and coloured cell fills make OCR glue cells together.
+// Erase long solid / dotted lines and turn light fills white before reading (only for clean digital pictures).
+export function cleanForOcr(cv, o = {}) {
+  const W = cv.width, H = cv.height;
+  const g = cv.getContext('2d', { willReadFrequently: true });
+  const im = g.getImageData(0, 0, W, H), d = im.data;
+  const lum = new Uint8Array(W * H);
+  let white = 0;
+  for (let i = 0, j = 0; i < d.length; i += 4, j++) { const l = (0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]) | 0; lum[j] = l; if (l > 235) white++; }
+  if (white < W * H * 0.45) return false;                  // a photo, not a screenshot: leave it alone
+  const LD = o.ld || 165, isD = j => lum[j] < LD;
+  const kill = new Uint8Array(W * H);
+  const hMin = Math.max(48, Math.round(W * 0.03)), vMin = Math.max(70, Math.round(H * 0.04));
+  const hraw = [], vraw = [];
+  // solid lines
+  for (let y = 0; y < H; y++) { let run = 0; for (let x = 0; x <= W; x++) { if (x < W && isD(y * W + x)) run++; else { if (run >= hMin) { for (let k = x - run; k < x; k++) kill[y * W + k] = 1; hraw.push({ y, x0: x - run, x1: x - 1 }); } run = 0; } } }
+  for (let x = 0; x < W; x++) { let run = 0; for (let y = 0; y <= H; y++) { if (y < H && isD(y * W + x)) run++; else { if (run >= vMin) { for (let k = y - run; k < y; k++) kill[k * W + x] = 1; vraw.push({ x, y0: y - run, y1: y - 1 }); } run = 0; } } }
+  // dotted lines: many short dashes with short gaps
+  const dotted = (len, at, out, mk) => {
+    let start = -1, last = -1, dashes = 0, run = 0;
+    const flush = () => { if (start >= 0 && dashes >= 10 && last - start >= hMin * 1.5) { for (let k = start; k <= last; k++) if (isD(at(k))) kill[at(k)] = 1; out.push(mk(start, last)); } start = -1; dashes = 0; };
+    for (let k = 0; k <= len; k++) {
+      const v = k < len && isD(at(k));
+      if (v) { run++; continue; }
+      if (run > 0) {
+        if (run <= 6) { const s0 = k - run; if (start >= 0 && s0 - last > 9) flush(); if (start < 0) start = s0; last = k - 1; dashes++; }
+        else flush();
+        run = 0;
+      }
+    }
+    flush();
+  };
+  for (let y = 0; y < H; y++) dotted(W, x => y * W + x, hraw, (a, b) => ({ y, x0: a, x1: b }));
+  for (let x = 0; x < W; x++) dotted(H, y => y * W + x, vraw, (a, b) => ({ x, y0: a, y1: b }));
+  for (let i = 0, j = 0; i < d.length; i += 4, j++) {
+    const v = kill[j] ? 255 : lum[j] > 165 ? 255 : (lum[j] * 0.55) | 0;
+    d[i] = d[i + 1] = d[i + 2] = v; d[i + 3] = 255;
+  }
+  g.putImageData(im, 0, 0);
+  // neighbouring pixel rows/columns of one line → one separator
+  const merge = (raw, pos, a0, a1) => {
+    raw.sort((p, q) => p[pos] - q[pos] || p[a0] - q[a0]);
+    const out = [];
+    for (const v of raw) {
+      const m = out.find(l => v[pos] - l.p1 <= 3 && v[pos] >= l.p0 && v[a0] <= l.b + 8 && v[a1] >= l.a - 8);
+      if (m) { m.p1 = v[pos]; m.a = Math.min(m.a, v[a0]); m.b = Math.max(m.b, v[a1]); }
+      else out.push({ p0: v[pos], p1: v[pos], a: v[a0], b: v[a1] });
+    }
+    return out;
+  };
+  const vlines = merge(vraw, 'x', 'y0', 'y1').map(l => ({ x: (l.p0 + l.p1) / 2, y0: l.a, y1: l.b }));
+  const hlines = merge(hraw, 'y', 'x0', 'x1').map(l => ({ y: (l.p0 + l.p1) / 2, x0: l.a, x1: l.b })).sort((p, q) => p.y - q.y);
+  return { vlines, hlines };
+}
+
+export async function ocrCanvas(cv, o = {}) {
   const w = await ocr();
+  const digital = o.clean ? cleanForOcr(cv, o) : false;
+  try { await w.setParameters({ tessedit_pageseg_mode: String(o.psm || (digital ? 11 : 3)), preserve_interword_spaces: '1' }); } catch { }
+  const vlines = digital ? digital.vlines : [], hlines = digital ? digital.hlines : [];
   const { data } = await w.recognize(cv, {}, { blocks: true, text: true });
   const items = [];
   for (const b of data.blocks || []) for (const p of b.paragraphs || []) for (const l of p.lines || []) {
@@ -187,10 +359,13 @@ export async function ocrCanvas(cv) {
     const base = l.baseline && Number.isFinite(l.baseline.y0) ? (l.baseline.y0 + l.baseline.y1) / 2 : l.bbox.y1 - lh * 0.2;
     for (const wd of l.words || []) {
       if (!wd.text || wd.confidence < 35) continue;
-      items.push({ s: wd.text, x: wd.bbox.x0, y: base, w: wd.bbox.x1 - wd.bbox.x0, h: lh, b: false });
+      if (/^[|\[\]{}_—=~¦!]+$/.test(wd.text.trim())) continue;          // table grid lines read as characters
+      if (/^[mMnNrRwWEe=~:.\-—_]{2,}$/.test(wd.text.trim()) && !/^(mm|Mei|ME)$/.test(wd.text.trim())) continue;   // dotted borders read as "mm", "EE"
+      items.push({ s: wd.text, x: wd.bbox.x0, y: base, w: wd.bbox.x1 - wd.bbox.x0, h: lh, b: false, t0: wd.bbox.y0, t1: wd.bbox.y1 });
     }
   }
-  return pageBlocks(items, cv.width, cv.height);
+  // measured on spreadsheet screenshots: column walls help, snapping rows to grid lines does not
+  return pageBlocks(items, cv.width, cv.height, { vlines: o.noWalls ? [] : vlines, hlines: o.snap ? hlines : [], ocr: true });
 }
 
 // ---------- images (OCR) ----------

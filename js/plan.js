@@ -19,15 +19,25 @@ const TYPES = new Set(['cover', 'agenda', 'kpi', 'chart', 'bullets', 'two', 'tab
 
 // ---------- numbers on slides must come from the document ----------
 const NUM_RX = /(?:rp\.?\s?)?[-−]?\d[\d.,]*(?:\s?(?:%|persen|jt|juta|rb|ribu|miliar|triliun|m\b|t\b))?/gi;
-export function unknownNumbers(text, nums) {
+export function unknownNumbers(text, nums, digits) {
   const bad = [];
   for (const m of String(text || '').matchAll(NUM_RX)) {
     const raw = m[0].trim().replace(/[.,]$/, '');
     if (!/\d/.test(raw)) continue;
+    const dg = raw.replace(/\D/g, '').replace(/^0+/, '');
+    if (digits && dg.length >= 2 && digits.has(dg)) continue;
     const p = parseNum(raw, 'id');
     const vals = [p?.v, parseNum(raw, 'en')?.v].filter(v => v != null && Number.isFinite(v));
     if (!vals.length) continue;
-    if (!vals.some(v => knownNumber(nums, v))) bad.push(raw);
+    // "Rp 8,8 M" or "3,1 juta" may be a rounded, rescaled document value; a plain "72" must be written in the document
+    const scaled = /rp|%|persen|jt|juta|rb|ribu|miliar|milyar|triliun|\bm\b|\bt\b|[.,]\d/i.test(raw);
+    if (!scaled) {
+      const v = vals[0];
+      if ((Number.isInteger(v) && Math.abs(v) <= 12) || (v >= 1990 && v <= 2100)) continue;
+      if (!digits || !digits.has(dg)) bad.push(raw);
+      continue;
+    }
+    if (!vals.some(v => knownNumber(nums, v, scaled))) bad.push(raw);
   }
   return bad;
 }
@@ -42,7 +52,7 @@ export function kpiValue(f) {
 }
 
 function chartData(c) {
-  return { type: c.type, title: c.title, cats: c.cats, series: c.series.map(s => ({ name: s.name, vals: s.vals, kind: s.kind, dash: s.dash, muted: s.muted })), unit: c.unit, ref: c.ref };
+  return { type: c.type, title: c.title, cats: c.cats, series: c.series.map(s => ({ name: s.name, vals: s.vals, kind: s.kind, dash: s.dash, muted: s.muted })), unit: c.unit, ref: c.ref, pct: c.pct, sort: c.sort, ach: c.ach, met: c.met, n: c.n };
 }
 function tableData(T, L, max = 11) {
   const t = L.content.tables[T.ti];
@@ -70,8 +80,18 @@ export async function planDeck(id, o, onProg = () => { }, signal) {
   };
   let spec = null;
   if (AI.ok()) {
-    try { spec = await aiPlan(L, fs, o, base, onProg, signal); }
-    catch (e) { if (e.code === 'batal') throw e; console.warn('plan ai', e); }
+    // one more try on a passing hiccup (busy model, timeout, unreadable answer) before the rule-based plan
+    for (let attempt = 0; attempt < 2 && !spec; attempt++) {
+      try { spec = await aiPlan(L, fs, o, base, onProg, signal); }
+      catch (e) {
+        if (e.code === 'batal') throw e;
+        console.warn('plan ai', e);
+        base.aiErr = String((e && (e.code || e.message)) || e);
+        try { window.__paparanPlanErr = base.aiErr; } catch { }
+        if (/kuota|auth/.test(base.aiErr) || !AI.ok()) break;
+        if (!attempt) onProg(0.15, 'AI sedang sibuk, mencoba sekali lagi…');
+      }
+    }
   }
   if (!spec) { onProg(0.6, 'Menyusun paparan dengan mesin tanpa AI'); spec = { ...base, ...autoPlan(L, fs, o), source: 'auto' }; }
   finalize(spec, L, fs);
@@ -84,7 +104,9 @@ async function aiPlan(L, fs, o, base, onProg, signal) {
   const dg = L.meta.digest || {};
   const factLines = fs.facts.filter(f => f.k !== 'text').sort((a, b) => b.w - a.w).slice(0, 60).map(f => `${f.id} ${f.text}`).join('\n');
   const textFacts = fs.facts.filter(f => f.k === 'text').slice(0, 16).map(f => `${f.id} "${f.text}"`).join('\n');
-  const chartLines = fs.charts.slice(0, 24).map(c => `${c.id} [${c.type}] ${c.title} — ${c.note} (dari ${c.t})`).join('\n');
+  const chartLines = orderCharts(fs, true).slice(0, 26).map(c => `${c.id} [${c.type}${c.pct ? ', persentase' : ''}] ${c.title} — ${c.note} (dari ${c.t})`).join('\n');
+  const nData = fs.facts.filter(f => f.v != null && f.k !== 'text').length;
+  const minCharts = Math.min(orderCharts(fs).length, o.len === 'ringkas' ? 2 : o.len === 'lengkap' ? 6 : 4);
   const tableLines = fs.tables.slice(0, 16).map(T => tableBrief(T)).join('\n');
   const budget = o.len === 'lengkap' ? 26000 : o.len === 'ringkas' ? 14000 : 20000;
   const text = docText(L.content, budget, 18);
@@ -100,9 +122,16 @@ PRINCIPLES
 - Start with the answer: right after the cover (and agenda, if any) put an executive summary "kpi" slide with the 3-4 most important numbers.
 - Every content slide title is an ACTION TITLE: one complete sentence (max 14 words) that states the insight, e.g. "${en ? 'October output reached 96.3% of target despite more downtime' : 'Produksi Oktober capai 96,3% target meski downtime meningkat'}". Not a topic label like "${en ? 'Production data' : 'Data Produksi'}".
 - Bullets: max 4 per slide, max 18 words each, concrete; each carries a fact, a comparison or an implication. No filler, no repetition.
-- Use ONLY facts, numbers, names and dates from the DOCUMENT, FACTS, CHARTS and TABLES. Never invent or estimate numbers. Copy numbers exactly (${en ? 'you may use English number format' : 'format Indonesia: 12.450,5 dan 96,3%'}).
+- Use ONLY facts, numbers, names and dates from the DOCUMENT, FACTS, CHARTS and TABLES. Never invent or estimate numbers. Never write fact/chart/table ids (F12, C3, T1) inside slide text — ids only go in the "fact", "chart" and "table" fields. Copy numbers exactly (${en ? 'you may use English number format' : 'format Indonesia: 12.450,5 dan 96,3%'}).
 - Show the data: use the available charts by id where they support the story (each chart at most once). The chart slide title states what the chart proves; its bullets explain peak/lowest/trend/gap/cause.
 - Use a "table" slide only for small tables that are clearer as a table.
+${nData ? `
+DATA FIRST (this document contains numeric data — the deck must be data-driven):
+- Numbers have priority: every content slide must show concrete values from FACTS / CHARTS / TABLES (totals, targets, achievement %, growth, highest/lowest, shares). No slide without numbers when the document has numbers for that topic.
+- The executive summary "kpi" slide uses the most important figures (e.g. total revenue, target, achievement %).
+- Use at least ${minCharts} "chart" slides (more if the length allows): one per main table/topic. Prefer charts that express percentages (marked "persentase": achievement vs target, share/composition) to present proportions.
+- When a value relates to a target or a total, state the percentage explicitly (e.g. "Omzet 2026 Rp 5,71 miliar = 15,87% dari target Rp 36 miliar").
+` : ''}
 - Build a logical storyline for this kind of document. For a production/operations report for example: executive summary → performance vs target → trend → breakdown (per line/product/shift) → issues, downtime or quality → actions/plan → conclusion. For a narrative document: context → key points per section → implications → conclusion.
 - Recommendations must follow from the document (stated plans/actions, or what the findings clearly require). Do not add generic advice.
 - "notes" = 1-3 sentences the presenter can say.
@@ -151,6 +180,7 @@ ${text}`;
     },
   });
   const j = parseJSON(r.text);
+  try { window.__paparanPlan = { at: Date.now(), model: r.model, chars: r.text.length, head: r.text.slice(0, 400), tail: r.text.slice(-400), ok: !!(j && Array.isArray(j.slides)) }; } catch { }
   if (!j || !Array.isArray(j.slides) || j.slides.length < 3) throw new Error('rencana AI tidak terbaca');
   onProg(0.9, 'Memeriksa angka & menata desain');
   return { ...base, title: short(j.title || base.title, 110), subtitle: short(j.subtitle || '', 160), slides: j.slides, source: 'ai', model: r.model };
@@ -164,8 +194,12 @@ function finalize(spec, L, fs) {
   const chartBy = Object.fromEntries(fs.charts.map(c => [c.id, c]));
   const tabBy = Object.fromEntries(fs.tables.map(T => [T.id, T]));
   const dropped = [];
-  const cleanTxt = s => String(s ?? '').replace(/\*\*|__/g, '').replace(/\s*\[(?:F|C|T)\d+\]/g, '').replace(/\s+/g, ' ').trim();
-  const okText = (s, where) => { const bad = unknownNumbers(s, nums); if (bad.length) { dropped.push({ where, text: s, bad }); return false; } return true; };
+  // the writer sometimes cites its sources ("(F52)", "[C3]", "F12, F13"): not slide text, and not numbers to check
+  const cleanTxt = s => String(s ?? '').replace(/\*\*|__/g, '')
+    .replace(/\s*[\[(]\s*(?:(?:F|C|T)\d+\s*[,;/&]?\s*)+[\])]/g, '')
+    .replace(/\b(?:F|C|T)\d{1,3}\b(?=\s*(?:[,;.)]|$))/g, '')
+    .replace(/\s+([,.;:])/g, '$1').replace(/\s+/g, ' ').trim();
+  const okText = (s, where) => { const bad = unknownNumbers(s, nums, fs.digits); if (bad.length) { dropped.push({ where, text: s, bad }); return false; } return true; };
   const okList = (a, where, max = 5) => (Array.isArray(a) ? a : []).map(cleanTxt).filter(Boolean).filter(s => okText(s, where)).map(s => short(s, 220)).slice(0, max);
   const usedCharts = new Set();
   const out = [];
@@ -190,18 +224,18 @@ function finalize(spec, L, fs) {
         // a note that only repeats the big number ("44,2 jam" under "44,2 jam") says nothing
         if (note && (note.includes(v) || (digits(note).length >= 2 && digits(note) === digits(v)))) note = note.replace(/(rp\s?)?[-\d.,]+\s*(%|jam|ton|kg|unit|jt|juta|m|miliar)?/gi, '').replace(/\s+/g, ' ').trim();
         if (note && note.replace(/[^a-z]/gi, '').length < 4) note = '';
-        return { fact: f.id, v, label: short(cleanTxt(k.label) || f.label || '', 40), note: short(note || f.sub || '', 50) };
+        return { fact: f.id, v, label: short(cleanTxt(k.label) || f.label || '', 40), note: short(note || f.sub || '', 50), pct: pctOf(f) };
       }).filter(Boolean).slice(0, 4);
       if (s.kpis.length < 2) {
         const extra = topKpis(fs).filter(f => !s.kpis.some(k => k.fact === f.id)).slice(0, 4 - s.kpis.length);
-        s.kpis.push(...extra.map(f => ({ fact: f.id, v: kpiValue(f), label: short(f.label || '', 40), note: short(f.sub || '', 50) })));
+        s.kpis.push(...extra.map(f => ({ fact: f.id, v: kpiValue(f), label: short(f.label || '', 40), note: short(f.sub || '', 50), pct: pctOf(f) })));
       }
       if (s.kpis.length < 2) s.type = s.points.length ? 'bullets' : 'skip';
     }
     if (s.type === 'chart') {
       const c = chartBy[String(s.chart || '').trim()];
       if (!c || usedCharts.has(c.id)) s.type = s.points.length ? 'bullets' : 'skip';
-      else { usedCharts.add(c.id); s.chartData = chartData(c); if (!s.title) s.title = c.title; }
+      else { usedCharts.add(c.id); s.chartId = c.id; s.chartData = chartData(c); if (!s.title) s.title = c.title; if (!s.points.length) s.points = chartPoints(c, en); }
     }
     if (s.type === 'table') {
       const T = tabBy[String(s.table || '').trim()];
@@ -224,6 +258,7 @@ function finalize(spec, L, fs) {
   // cover first, end last
   if (out[0]?.type !== 'cover') out.unshift({ type: 'cover' });
   if (out[out.length - 1]?.type !== 'end') out.push({ type: 'end', title: en ? 'Thank you' : 'Terima kasih' });
+  ensureData(out, fs, en);
   const cov = out[0];
   cov.title ||= spec.title; cov.subtitle ||= spec.subtitle || ''; cov.meta ||= [spec.org, spec.period].filter(Boolean).join(' · ');
   cov.kicker ||= spec.kicker;
@@ -240,6 +275,48 @@ function finalize(spec, L, fs) {
   for (const s of out) if (s.type === 'section') s.num = ++sec;
   spec.slides = out;
   spec.dropped = dropped;
+}
+
+// a progress bar only for "how far toward the target / share of the whole", not for a growth rate
+const pctOf = f => (f && f.v != null && (f.k === 'ach' || f.k === 'share' || f.k === 'worst' || (f.unit === '%' && /pencapaian|capaian|achievement|target|realisasi|porsi|share|persentase/i.test(f.label || f.text || '') && !/perubahan|tren|naik|turun|growth/i.test(f.label || ''))) && f.v >= 0 && f.v <= 400 ? +f.v : undefined);
+
+// charts worth showing: the best one of each table first, percentage charts favoured, generic "Kolom 3" charts last/out
+export function orderCharts(fs, all = false) {
+  const ok = fs.charts.filter(c => (all || !c.weak) && c.cats.length >= 2 && c.series.some(x => x.vals.filter(v => v != null).length >= 2));
+  const byT = new Map();
+  for (const c of ok) { if (!byT.has(c.t)) byT.set(c.t, []); byT.get(c.t).push(c); }
+  const rank = c => (c.weak ? 10 : 0) + (c.type === 'combo' ? -2 : 0) + (c.pct ? -1 : 0);
+  const lists = [...byT.values()].map(l => l.slice().sort((a, b) => rank(a) - rank(b)));
+  const out = [];
+  for (let round = 0; out.length < ok.length && round < 20; round++) for (const l of lists) if (l[round]) out.push(l[round]);
+  return out.sort((a, b) => (a.weak ? 1 : 0) - (b.weak ? 1 : 0));
+}
+
+// The deck must show the numbers: a KPI summary and enough charts, added from the data when the writer left them out.
+function ensureData(slides, fs, en) {
+  const numFacts = fs.facts.filter(f => f.v != null && f.k !== 'text');
+  const charts = orderCharts(fs);
+  if (!numFacts.length && !charts.length) return;
+  // before the conclusion, and before a closing section divider that introduces it
+  const endAt = () => { let i = slides.findIndex(s => s.type === 'conclusion' || s.type === 'end'); if (i < 0) i = slides.length; while (i > 1 && slides[i - 1].type === 'section') i--; return i; };
+  if (!slides.some(s => s.type === 'kpi')) {
+    const kp = topKpis(fs);
+    if (kp.length >= 2) {
+      const ag = slides.findIndex(s => s.type === 'agenda');
+      slides.splice(ag >= 0 ? ag + 1 : 1, 0, { type: 'kpi', title: en ? 'Key figures at a glance' : 'Ringkasan angka utama', kpis: kp.map(f => ({ fact: f.id, v: kpiValue(f), label: short(f.label || '', 40), note: short(f.sub || '', 50), pct: pctOf(f) })), points: [], auto: 1 });
+    }
+  }
+  const used = new Set(slides.filter(s => s.chartId).map(s => s.chartId));
+  const content = slides.filter(s => !/^(cover|agenda|end|section)$/.test(s.type)).length;
+  const want = Math.min(charts.length, Math.max(2, Math.round(content * 0.5)));
+  let have = used.size;
+  for (const c of charts) {
+    if (have >= want) break;
+    if (used.has(c.id)) continue;
+    slides.splice(endAt(), 0, { type: 'chart', chartId: c.id, chartData: chartData(c), title: chartTitle(c, en), points: chartPoints(c, en), auto: 1 });
+    used.add(c.id); have++;
+  }
+  for (const s of slides) if (s.type === 'chart' && s.chartData && !(s.points || []).length) s.points = chartPoints(s.chartData, en);
 }
 
 function topKpis(fs) {
@@ -261,12 +338,11 @@ export function autoPlan(L, fs, o) {
   const c = L.content;
   const cands = [];
   const kp = topKpis(fs);
-  if (kp.length >= 2) cands.push({ pr: 100, s: { type: 'kpi', title: en ? 'Key figures at a glance' : 'Ringkasan angka utama', kpis: kp.map(f => ({ fact: f.id, label: f.label, note: f.sub || '' })), points: (dg.points || []).filter(p => !/\d/.test(p) || unknownNumbers(p, fs.nums).length === 0).slice(0, 3) } });
+  if (kp.length >= 2) cands.push({ pr: 100, s: { type: 'kpi', title: en ? 'Key figures at a glance' : 'Ringkasan angka utama', kpis: kp.map(f => ({ fact: f.id, label: f.label, note: f.sub || '', pct: pctOf(f) })), points: (dg.points || []).filter(p => !/\d/.test(p) || unknownNumbers(p, fs.nums, fs.digits).length === 0).slice(0, 3) } });
   // charts: best per table first, then the rest
   const byT = {};
-  for (const ch of fs.charts) (byT[ch.t] ||= []).push(ch);
-  let rank = 0;
-  for (const list of Object.values(byT)) list.forEach((ch, k) => cands.push({ pr: 80 - k * 15 - rank * 2, s: { type: 'chart', chart: ch.id, title: chartTitle(ch, en), points: chartPoints(ch, en) } }, rank++));
+  for (const ch of orderCharts(fs)) (byT[ch.t] ||= []).push(ch);
+  orderCharts(fs).forEach((ch, k) => cands.push({ pr: 85 - k * 3, s: { type: 'chart', chart: ch.id, title: chartTitle(ch, en), points: chartPoints(ch, en) } }));
   // narrative sections → bullet slides
   const secs = [];
   let cur = null;
@@ -306,7 +382,8 @@ function chartTitle(ch, en) {
     const a = s0.vals, t = ch.series[1].vals;
     let sa = 0, stt = 0, met = 0, n = 0;
     a.forEach((v, k) => { if (v != null && t[k]) { sa += v; stt += t[k]; n++; if (v >= t[k]) met++; } });
-    const ach = stt ? sa / stt * 100 : 0;
+    const ach = ch.ach != null ? ch.ach : stt ? sa / stt * 100 : 0;
+    if (ch.met != null) { met = ch.met; n = ch.n || n; }
     return en ? `${s0.name} reached ${fmtNum(ach, 1)}% of target; ${met} of ${n} periods on target` : `${s0.name} mencapai ${fmtNum(ach, 1)}% dari target; ${met} dari ${n} periode memenuhi target`;
   }
   if (ch.type === 'pareto') {

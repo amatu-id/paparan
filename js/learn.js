@@ -114,25 +114,44 @@ async function learnIn(id, kind, file, onProg, onStart) {
   onStart(id);
   await DB.put('files', { id, blob: file });
   try {
-    const c = await extract(file, (p, t) => { onProg(p * 0.7, t); });
-    if (!c.blocks.length && !c.tables.length) throw new Error('Tidak ada teks yang bisa dibaca di file ini.');
-    onProg(0.72, 'Menyusun pengetahuan');
-    c.id = id;
-    c.chunks = chunk(c);
-    c.stats = { chars: c.chunks.reduce((a, k) => a + k.x.length, 0), tables: c.tables.length, blocks: c.blocks.length };
-    c.stats.tokens = tokensOf('x'.repeat(c.stats.chars));
-    await DB.put('content', c);
-    const title = c.meta.title && c.meta.title.length > 3 && !/^(microsoft|untitled|document|dokumen|presentation)/i.test(c.meta.title) ? c.meta.title : (c.blocks.find(b => b.t === 'h')?.x || baseName(file.name));
-    Object.assign(meta, { status: 'indeks', title: short(title, 120), pages: c.units.length, unitKind: c.kind, lang: c.meta.lang, tables: c.tables.length, chunks: c.chunks.length, tokens: c.stats.tokens, ocr: c.meta.ocr || 0, legacy: c.meta.legacy || 0 });
-    await DB.put('docs', meta);
-    forget(id);
-    await deepenIn(id, onProg);
+    await absorb(id, meta, file, onProg);
     return id;
   } catch (e) {
     await DB.patch('docs', id, { status: 'gagal', err: String(e.message || e).slice(0, 300) });
     throw e;
   }
 }
+// read the file, store what was learned, then the AI part
+async function absorb(id, meta, file, onProg) {
+  const c = await extract(file, (p, t) => { onProg(p * 0.7, t); });
+  if (!c.blocks.length && !c.tables.length) throw new Error('Tidak ada teks yang bisa dibaca di file ini.');
+  onProg(0.72, 'Menyusun pengetahuan');
+  c.id = id;
+  c.chunks = chunk(c);
+  c.stats = { chars: c.chunks.reduce((a, k) => a + k.x.length, 0), tables: c.tables.length, blocks: c.blocks.length };
+  c.stats.tokens = tokensOf('x'.repeat(c.stats.chars));
+  await DB.put('content', c);
+  await DB.del('vec', id).catch(() => { });
+  const title = c.meta.title && c.meta.title.length > 3 && !/^(microsoft|untitled|document|dokumen|presentation)/i.test(c.meta.title) ? c.meta.title : (c.blocks.find(b => b.t === 'h')?.x || baseName(file.name));
+  Object.assign(meta, { status: 'indeks', title: short(title, 120), pages: c.units.length, unitKind: c.kind, lang: c.meta.lang, tables: c.tables.length, chunks: c.chunks.length, tokens: c.stats.tokens, ocr: c.meta.ocr || 0, imgs: c.meta.imgs || 0, legacy: c.meta.legacy || 0, cv: c.v || 1 });
+  await DB.put('docs', meta);
+  forget(id);
+  await deepenIn(id, onProg);
+}
+
+// Read a stored document again with the current reader (keeps its id, Q&A history and presentations)
+export function reread(id, onProg = () => { }) {
+  return withLock(id, async () => {
+    const [meta, f] = await Promise.all([DB.get('docs', id), DB.get('files', id)]);
+    if (!meta) throw new Error('Dokumen tidak ditemukan');
+    if (!f?.blob) throw new Error('File asli tidak ada di perangkat ini. Unggah ulang file-nya.');
+    const file = f.blob instanceof File ? f.blob : new File([f.blob], meta.name, { type: meta.mime || '' });
+    await DB.patch('docs', id, { status: 'baca', prog: 0, err: null });
+    try { await absorb(id, await DB.get('docs', id), file, onProg); }
+    catch (e) { await DB.patch('docs', id, { status: 'gagal', err: String(e.message || e).slice(0, 300) }); throw e; }
+  });
+}
+export { CONTENT_V } from './extract.js';
 
 // AI part (embeddings + digest). Also used by "Pelajari ulang". Without AI the offline digest is used.
 export function deepen(id, onProg = () => { }) { return withLock(id, () => deepenIn(id, onProg)); }

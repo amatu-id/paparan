@@ -1,6 +1,6 @@
 // Word, PowerPoint, Excel / ODF and legacy binary Office files → content model.
 import { JSZip, XLSX } from './libs.js';
-import { Doc, clean, readText } from './extract.js';
+import { Doc, clean, readText, ocrImageBlob, MAX_IMG } from './extract.js';
 import { idle } from './util.js';
 
 const W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
@@ -37,6 +37,28 @@ const joinPath = (base, t) => {
   return parts.join('/');
 };
 
+// pictures inside Word / PowerPoint files: screenshots of tables are read with OCR
+const IMG_TYPE = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', bmp: 'image/bmp', webp: 'image/webp' };
+async function ocrZipImage(zip, path, budget) {
+  const ext = path.split('.').pop().toLowerCase();
+  if (!IMG_TYPE[ext] || budget.n >= MAX_IMG || budget.done.has(path)) return null;
+  const f = zip.file(path);
+  if (!f) return null;
+  budget.n++; budget.done.add(path);
+  const buf = await f.async('arraybuffer');
+  if (buf.byteLength < 6000) return null;                       // icons, bullets, logos
+  const res = await ocrImageBlob(new Blob([buf], { type: IMG_TYPE[ext] }));
+  if (!res) return null;
+  const letters = res.blocks.reduce((a, b) => a + (b.x || '').replace(/[^a-z0-9]/gi, '').length, 0);
+  return res.tables.length || letters >= 25 ? res : null;      // a photo without text adds nothing
+}
+function addOcr(D, res, u) {
+  for (const b of res.blocks) {
+    if (b.t === 'tbl') D.table({ ...res.tables[b.ti], img: 1 }, u);
+    else D.add(b.t, b.x, u, b.t === 'h' ? { lv: 3 } : {});
+  }
+}
+
 // ---------- DOCX ----------
 export async function extractDocx(file, prog) {
   prog(0.1, 'Membuka dokumen Word');
@@ -61,6 +83,9 @@ export async function extractDocx(file, prog) {
     }
   }
   prog(0.3, 'Membaca isi dokumen');
+  const relF = zip.file('word/_rels/document.xml.rels');
+  const drel = relF ? rels(xml(await relF.async('string'))) : {};
+  const budget = { n: 0, done: new Set() };
   const doc = xml(await docF.async('string'));
   const body = desc(doc, W, 'body')[0];
   let page = 0;
@@ -107,13 +132,24 @@ export async function extractDocx(file, prog) {
     // header: the rows marked as repeating headers, else the first row
     return { head: grid[0], rows: grid.slice(1) };
   };
-  const walk = el => {
+  const pictures = async (n, u) => {
+    const ids = [...desc(n, A, 'blip').map(b => b.getAttributeNS(R, 'embed')), ...[...n.getElementsByTagNameNS('urn:schemas-microsoft-com:vml', 'imagedata')].map(v => v.getAttributeNS(R, 'id'))].filter(Boolean);
+    for (const id of ids) {
+      const t = drel[id]?.t;
+      if (!t) continue;
+      prog(0.4, 'Membaca isi gambar di dokumen (tabel/angka)');
+      const res = await ocrZipImage(zip, joinPath('word/document.xml', t), budget).catch(() => null);
+      if (res) { addOcr(D, res, u); D.meta.imgs = (D.meta.imgs || 0) + 1; }
+    }
+  };
+  const walk = async el => {
     for (const n of el.childNodes) {
       if (n.nodeType !== 1) continue;
       const ln = n.localName;
       if (ln === 'p') {
         const { s, bold } = runText(n);
         const u = unitAt();
+        await pictures(n, u);
         const pPr = kid(n, W, 'pPr');
         const sid = pPr && att(kid(pPr, W, 'pStyle'), W, 'val');
         const st = styles[sid] || {};
@@ -133,10 +169,10 @@ export async function extractDocx(file, prog) {
         if (t.rows.length === 0 || (t.head.length === 1 && t.rows.every(r => r.length === 1))) {
           for (const r of [t.head, ...t.rows]) D.add('p', r.join(' '), unitAt());     // a one-cell layout table is just text
         } else D.table({ title, head: t.head, rows: t.rows }, unitAt());
-      } else if (ln === 'sdt' || ln === 'sdtContent' || ln === 'customXml' || ln === 'smartTag' || ln === 'ins') walk(n);
+      } else if (ln === 'sdt' || ln === 'sdtContent' || ln === 'customXml' || ln === 'smartTag' || ln === 'ins') await walk(n);
     }
   };
-  walk(body);
+  await walk(body);
   D.meta.pages = units.length;
   if (units.length === 1) D.units[0].label = 'Dokumen';
   return D.out();
@@ -153,6 +189,7 @@ export async function extractPptx(file, prog) {
   const pres = xml(await presF.async('string'));
   const prel = rels(xml(await zip.file('ppt/_rels/presentation.xml.rels').async('string')));
   const ids = desc(pres, P, 'sldId').map(s => s.getAttributeNS(R, 'id'));
+  const budget = { n: 0, done: new Set() };
   const paths = ids.map(id => prel[id] && joinPath('ppt/presentation.xml', prel[id].t)).filter(Boolean);
   for (const [k, path] of paths.entries()) {
     prog(0.1 + 0.85 * k / paths.length, `Membaca slide ${k + 1} dari ${paths.length}`);
@@ -171,6 +208,7 @@ export async function extractPptx(file, prog) {
         if (n.localName === 'grpSp') { visit(n); continue; }
         if (n.localName === 'sp') shapes.push({ el: n, kind: 'sp' });
         else if (n.localName === 'graphicFrame') shapes.push({ el: n, kind: 'gf' });
+        else if (n.localName === 'pic') shapes.push({ el: n, kind: 'pic' });
       }
     };
     visit(tree);
@@ -179,6 +217,16 @@ export async function extractPptx(file, prog) {
     const ph = s => { const p = s.el.getElementsByTagNameNS(P, 'ph')[0]; return p ? p.getAttribute('type') || 'body' : ''; };
     shapes.sort((a, b) => (/title/i.test(ph(b)) ? 1 : 0) - (/title/i.test(ph(a)) ? 1 : 0));
     for (const s of shapes) {
+      if (s.kind === 'pic') {
+        const id = desc(s.el, A, 'blip')[0]?.getAttributeNS(R, 'embed');
+        const t = id && srel[id]?.t;
+        if (t) {
+          prog(0.1 + 0.85 * k / paths.length, `Membaca isi gambar di slide ${k + 1} (tabel/angka)`);
+          const res = await ocrZipImage(zip, joinPath(path, t), budget).catch(() => null);
+          if (res) { addOcr(D, res, u); D.meta.imgs = (D.meta.imgs || 0) + 1; }
+        }
+        continue;
+      }
       if (s.kind === 'sp') {
         const type = ph(s);
         const paras = desc(s.el, A, 'p').map(p => ({ t: desc(p, A, 't').map(t => t.textContent).join(''), lvl: +(kid(p, A, 'pPr')?.getAttribute('lvl') || 0) })).filter(p => p.t.trim());

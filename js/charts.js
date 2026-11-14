@@ -99,6 +99,7 @@ export function chartSVG(ch, W, H, th, o = {}) {
         if (n <= 16) T(xb + 5, y + bh / 2, fmtShort(v, unit), { base: 'middle', size: fs * 0.92, fill: C.tx, weight: 600 });
       });
     });
+    if (ch.ref != null && ch.ref >= sc.lo && ch.ref <= sc.hi) out.push(`<line x1="${X(ch.ref)}" y1="${y0}" x2="${X(ch.ref)}" y2="${y1}" stroke="${C.a2}" stroke-width="1.6" stroke-dasharray="5 4"/>`);
     return wrapSvg(out.join(''), W, H, F);
   }
   const x0 = tickW, x1 = W - right, y0 = top + fs * 0.8;
