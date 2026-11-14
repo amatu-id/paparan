@@ -224,8 +224,15 @@ function finalize(spec, L, fs) {
         // a note that only repeats the big number ("44,2 jam" under "44,2 jam") says nothing
         if (note && (note.includes(v) || (digits(note).length >= 2 && digits(note) === digits(v)))) note = note.replace(/(rp\s?)?[-\d.,]+\s*(%|jam|ton|kg|unit|jt|juta|m|miliar)?/gi, '').replace(/\s+/g, ' ').trim();
         if (note && note.replace(/[^a-z]/gi, '').length < 4) note = '';
-        return { fact: f.id, v, label: short(cleanTxt(k.label) || f.label || '', 40), note: short(note || f.sub || '', 50), pct: pctOf(f) };
-      }).filter(Boolean).slice(0, 4);
+        return { fact: f.id, v, label: short(cleanTxt(k.label) || f.label || '', 40), note: short(note || f.sub || '', 50), pct: pctOf(f), _f: f };
+      }).filter(Boolean);
+      // one figure, one card: when two cards show the same fact keep the one whose label fits it ("Pencapaian
+      // target 15,9%", not "Omzet 2026 15,9%"); a currency word on a percentage is the wrong label
+      const words = x => new Set(String(x || '').toLowerCase().split(/[^a-z0-9]+/).filter(w => w.length >= 3));
+      const fit = k => { const a = words(k.label), b = words(k._f.label + ' ' + k._f.text); let n = 0; for (const w of a) if (b.has(w)) n++; if (k._f.unit === '%' && /\b(omzet|omset|nilai|total|rp|rupiah|jumlah)\b/i.test(k.label) && !/(pencapaian|persen|%|realisasi)/i.test(k.label)) n -= 5; return n; };
+      const best = new Map();
+      for (const k of s.kpis) { const o = best.get(k.fact); if (!o || fit(k) > fit(o)) best.set(k.fact, k); }
+      s.kpis = s.kpis.filter(k => best.get(k.fact) === k).slice(0, 4).map(({ _f, ...k }) => k);
       if (s.kpis.length < 2) {
         const extra = topKpis(fs).filter(f => !s.kpis.some(k => k.fact === f.id)).slice(0, 4 - s.kpis.length);
         s.kpis.push(...extra.map(f => ({ fact: f.id, v: kpiValue(f), label: short(f.label || '', 40), note: short(f.sub || '', 50), pct: pctOf(f) })));
@@ -315,6 +322,17 @@ function ensureData(slides, fs, en) {
     if (used.has(c.id)) continue;
     slides.splice(endAt(), 0, { type: 'chart', chartId: c.id, chartData: chartData(c), title: chartTitle(c, en), points: chartPoints(c, en), auto: 1 });
     used.add(c.id); have++;
+  }
+  // a statement table (cash in / cash out summary) is the document's own bottom line: it always gets a slide with
+  // every line and its totals / balances spelled out
+  for (const T of fs.tables.filter(T => T.kind === 'statement')) {
+    const tc = fs.charts.filter(c => c.t === T.id);
+    if (slides.some(s => s.table === T.id || (s.chartId && tc.some(c => c.id === s.chartId)))) continue;
+    const c = tc.find(c => c.type === 'bar') || tc[0];
+    if (!c) continue;
+    const key = fs.facts.filter(f => f.ti === T.ti && (f.k === 'stot' || (f.k === 'row' && f.w >= 8))).slice(0, 4).map(f => f.text.replace(/^\[[^\]]+\]\s*/, ''));
+    const title = short(String(T.title || '').replace(/\s*diperbaharui.*$/i, '').trim(), 60) || (en ? 'Summary' : 'Ringkasan');
+    slides.splice(endAt(), 0, { type: 'chart', chartId: c.id, chartData: chartData(c), title, points: key.length ? key : chartPoints(c, en), auto: 1 });
   }
   for (const s of slides) if (s.type === 'chart' && s.chartData && !(s.points || []).length) s.points = chartPoints(s.chartData, en);
 }

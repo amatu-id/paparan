@@ -43,11 +43,12 @@ export async function PptxGen() { await script(U.pptx); return window.PptxGenJS;
 export async function htmlToImage() { await script(U.h2i); return window.htmlToImage; }
 export async function jsPDF() { await script(U.jspdf); return window.jspdf.jsPDF; }
 
-// OCR worker (Indonesian + English), shared and kept while the page is open
-let ocrp;
-export function ocr() {
-  return ocrp ||= (async () => {
+// OCR workers, shared and kept while the page is open: Indonesian + English for scanned text, English alone for
+// screenshots of tables (measured: the Indonesian model reads a serif "7" as "1"; English reads the figures right)
+const ocrp = {};
+export function ocr(lang = 'ind+eng') {
+  return ocrp[lang] ||= (async () => {
     const T = await Tesseract();
-    return T.createWorker(['ind', 'eng'], 1, { logger: () => { } });
-  })().catch(e => { ocrp = null; throw e; });
+    return T.createWorker(lang.split('+'), 1, { logger: () => { } });
+  })().catch(e => { delete ocrp[lang]; throw e; });
 }

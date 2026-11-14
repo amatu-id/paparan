@@ -28,6 +28,7 @@ export function analyzeTable(t, lang = 'id') {
     const [id, en] = ev[i];
     return { i, name: short(h || 'Kolom ' + (i + 1), 80), loc: en > id ? 'en' : id > en ? 'id' : tloc, unitH: headerUnit(h) };
   });
+  for (const c of cols) c.dup = cols.some(o => o !== c && bare(o.name).toLowerCase() === bare(c.name).toLowerCase());
   const P = rows.map((r, ri) => r.map((cell, c) => {
     const raw = t.nums?.[ri]?.[c];
     if (typeof raw === 'number') return { v: raw, unit: '', kind: 'num' };
@@ -37,6 +38,13 @@ export function analyzeTable(t, lang = 'id') {
   const txt = (ri, c) => String(rows[ri][c] ?? '').trim();
   const isTotal = rows.map((r, ri) => [0, 1].some(c => c < C && RX.total.test(txt(ri, c))));
   const data = rows.map((_, i) => i).filter(i => !isTotal[i] && !t.groups?.[i] && rows[i].some(x => x !== '' && x != null));
+  // sections: a group row ("PEMASUKKAN (CASH IN)") heads the rows below it
+  const sections = [];
+  rows.forEach((r, i) => {
+    if (t.groups?.[i]) { sections.push({ name: short(r.filter(x => x !== '' && x != null).join(' '), 60), rows: [] }); return; }
+    if (!sections.length) sections.push({ name: '', rows: [] });
+    sections[sections.length - 1].rows.push(i);
+  });
   for (const col of cols) {
     let ne = 0, nn = 0, np = 0, ints = 0;
     const units = {}, periods = [], seen = new Set();
@@ -165,8 +173,14 @@ export function analyzeTable(t, lang = 'id') {
     pairs.push({ a, t: t2, ach, sa, st: st2, per: own ? own.vals : per, met: own ? own.vals.filter(v => v != null && v >= 100).length : met, n: per.filter(v => v != null).length, worst, gap: sa - st2, own: !!ownTotal, sums: !ownTotal || (a.docTotal != null && t2.docTotal != null) });
   }
   const achCol = measures.find(m => m.role === 'ach' && pairs.length && pctCols.includes(m)) || measures.find(m => m.role === 'ach');
+  // a statement (cash in / cash out, income / costs, subtotals): sections or several total rows — its rows are
+  // not one population, so no sums, averages or rankings across them
+  const nGroups = sections.filter(x => x.name).length, nTot = isTotal.filter(Boolean).length;
+  const statement = measures.length > 0 && !(dim && dim.kind === 'period') && (nGroups >= 2 || (nGroups >= 1 && nTot >= 1) || nTot >= 2);
+  const rowLab = rows.map((r, i) => (dim && txt(i, dim.i)) || String(r.find((x, c) => x && !P[i][c] && /[a-z]{3}/i.test(String(x))) ?? '').trim());
   let kind = 'list';
-  if (dim && dim.kind === 'period' && measures.length && data.length >= 2) kind = 'series';
+  if (statement) kind = 'statement';
+  else if (dim && dim.kind === 'period' && measures.length && data.length >= 2) kind = 'series';
   else if (wide && data.length >= 1) kind = 'wide';
   else if (dim && measures.length && data.length >= 2) kind = 'category';
   else if (C === 2 && data.length <= 40) kind = 'kv';
@@ -182,7 +196,7 @@ export function analyzeTable(t, lang = 'id') {
       for (const p of pairs) p.per = re(p.per);
     }
   }
-  return { title: t.title, kind, cols, dim, measures, labels, data, pairs, achCol, wide, P, rows, n: data.length };
+  return { title: t.title, kind, cols, dim, measures, labels, data, pairs, achCol, wide, P, rows, n: data.length, sections, isTotal, rowLab };
 }
 
 export function stats(vals, labels) {
@@ -211,7 +225,9 @@ export function stats(vals, labels) {
 
 const unitTxt = u => (u && u !== '%' && !/^rp/i.test(u) ? ' ' + u : '');
 const V = (v, u) => fmtVal(v, u);
-const mName = m => m.name.replace(/\s*[([][^)\]]*[)\]]\s*/g, ' ').replace(/\s+/g, ' ').trim() || m.name;
+// "Realisasi SPH (%)" keeps its bracket only when the table also has a plain "Realisasi SPH"
+const bare = name => String(name).replace(/\s*[([][^)\]]*[)\]]\s*/g, ' ').replace(/\s+/g, ' ').trim();
+const mName = m => (m.dup ? String(m.name).replace(/\s+/g, ' ').trim() : bare(m.name)) || m.name;
 
 // ---------- the fact sheet for one document ----------
 export function factSheet(content) {
@@ -233,6 +249,7 @@ export function factSheet(content) {
     const goodHead = h => { const x = String(h || '').trim(); return x && !/^kolom \d+$/i.test(x) && !/^\d/.test(x) && x.length <= 48 && (x.match(/[a-z]/gi) || []).length >= 2; };
     const weak = t.head.filter(goodHead).length < Math.max(2, t.head.length * 0.5) || A.n < 2;
     T.weak = weak;
+    if (A.kind === 'statement') { statementFacts(A, T, ti, fact, addNum, charts); return; }
     // row facts ("Piutang Internal HO/Project: Rp 10.017.894.042") for short tables: exact values the writer can quote
     if (A.n <= 15 && (weak || A.kind === 'category' || A.kind === 'kv')) {
       let k = 0;
@@ -249,7 +266,8 @@ export function factSheet(content) {
       }
     }
     // measures by importance
-    const ms = weak ? [] : [...A.measures].sort((a, b) => imp(b) - imp(a)).slice(0, 5);
+    // a column whose header could not be read ("Kolom 7") gives no named fact
+    const ms = weak ? [] : [...A.measures].filter(m => !/^kolom \d+$/i.test(mName(m))).sort((a, b) => imp(b) - imp(a)).slice(0, 5);
     for (const m of ms) {
       const s = m.st;
       if (!s.n) continue;
@@ -262,12 +280,14 @@ export function factSheet(content) {
         fact(`${tl}${/^(total|jumlah)$/i.test(nm) ? '' : ` (${scope})`}: ${V(tot, u)}`, tot, u, ti, base + 3, { m: m.i, k: 'total', label: tl });
         if (m.docTotal != null && Math.abs(m.docTotal - s.sum) > Math.abs(m.docTotal) * 0.01) addNum(s.sum);
       }
-      if (s.n >= 2) {
+      const flat = s.n >= 2 && s.max === s.min;
+      if (flat) fact(`${nm} sama setiap ${dimN}: ${V(s.max, u)}`, s.max, u, ti, base, { m: m.i, k: 'value', label: nm });
+      else if (s.n >= 2) {
         if (s.n >= 3) fact(`Rata-rata ${nm} per ${dimN}: ${V(s.mean, u)}`, s.mean, u, ti, base, { m: m.i, k: 'mean', label: 'Rata-rata ' + nm });
         fact(`${nm} tertinggi: ${s.maxL} (${V(s.max, u)})`, s.max, u, ti, base + 1, { m: m.i, k: 'max', label: nm + ' tertinggi', sub: s.maxL });
         fact(`${nm} terendah: ${s.minL} (${V(s.min, u)})`, s.min, u, ti, base + 0.5, { m: m.i, k: 'min', label: nm + ' terendah', sub: s.minL });
       } else fact(`${nm}: ${V(s.first, u)}`, s.first, u, ti, base + 1, { m: m.i, k: 'value', label: nm });
-      if (A.kind === 'series' && s.n >= 3 && s.changePct != null) {
+      if (A.kind === 'series' && s.n >= 3 && s.changePct != null && !flat) {
         fact(`Perubahan ${nm} dari ${s.firstL} (${V(s.first, u)}) ke ${s.lastL} (${V(s.last, u)}): ${s.changePct > 0 ? '+' : ''}${fmtNum(s.changePct, 1)}%${s.trend ? ', tren ' + s.trend : ''}`, s.changePct, '%', ti, base + 1.5, { m: m.i, k: 'change', label: 'Perubahan ' + nm });
         addNum(s.change); addNum(Math.abs(s.changePct)); addNum(Math.abs(s.change));
       }
@@ -332,6 +352,42 @@ export function factSheet(content) {
   for (const t of content.tables) { t.head.forEach(addD); for (const r of t.rows) r.forEach(addD); }
   return { facts, charts, tables, nums: sorted, digits };
 }
+// A statement table: every line as a fact (totals and balances first), shares only inside a section whose own
+// total row equals the sum of its lines, a donut for that composition and a bar chart of all lines.
+function statementFacts(A, T, ti, fact, addNum, charts) {
+  const m = [...A.measures].sort((a, b) => imp(b) - imp(a))[0];
+  const u = m.unit || '';
+  const val = i => A.P[i][m.i]?.v ?? null;
+  const lab = i => A.rowLab[i] || '';
+  const balance = s => /\(\s*\d+\s*[-+x×/]\s*\d+/.test(s) || /\b(sisa|saldo|selisih|laba|rugi|net|neto|bersih|surplus|defisit|perlu bayar|kurang bayar|lebih bayar)\b/i.test(s);
+  const cats = [], vals = [];
+  let k = 0;
+  for (const s of A.sections) {
+    for (const i of s.rows) {
+      const v = val(i), l = lab(i);
+      if (v == null || !l || l.length > 120) continue;
+      const tot = A.isTotal[i];
+      if (k++ < 24) fact(`${s.name ? '[' + s.name + '] ' : ''}${short(l, 90)}: ${V(v, u)}`, v, u, ti, tot ? 8.5 : balance(l) ? 8 : 5, { k: tot ? 'stot' : 'row', label: short(l, 40), sub: s.name || '' });
+      cats.push(short(l, 40)); vals.push(v);
+    }
+    const parts = s.rows.filter(i => !A.isTotal[i] && val(i) != null);
+    for (const tr of s.rows.filter(i => A.isTotal[i] && val(i) != null)) {
+      const above = parts.filter(i => i < tr), tot = val(tr);
+      const sum = above.reduce((a, i) => a + val(i), 0);
+      if (above.length < 2 || !tot || Math.abs(sum - tot) > Math.abs(tot) * 0.005 || above.some(i => val(i) < 0)) continue;
+      const tl = short(lab(tr) || 'total', 40);
+      for (const i of above) {
+        const p = val(i) / tot * 100;
+        fact(`${short(lab(i), 70)} = ${fmtNum(p, 1)}% dari ${tl} (${V(val(i), u)} dari ${V(tot, u)})`, p, '%', ti, 6.5, { k: 'share', label: 'Porsi ' + short(lab(i), 30), sub: tl });
+        addNum(p);
+      }
+      charts.push({ id: 'C' + (charts.length + 1), t: T.id, ti: T.ti, type: 'donut', title: `Komposisi ${tl}`, cats: above.map(i => short(lab(i), 40)), unit: u, series: [{ name: mName(m), vals: above.map(val) }], pct: 1, note: `porsi tiap rincian terhadap ${tl} (jumlah rinciannya sama dengan total di dokumen)` });
+      break;
+    }
+  }
+  if (cats.length >= 3) charts.push({ id: 'C' + (charts.length + 1), t: T.id, ti: T.ti, type: 'bar', title: `Rincian ${short(T.title, 50)}`, cats: cats.slice(0, 14), unit: u, series: [{ name: mName(m), vals: vals.slice(0, 14) }], note: `nilai tiap baris sesuai dokumen, urutan dokumen (baris jumlah ikut ditampilkan)` });
+}
+
 function imp(m) {
   let s = 1;
   if (/^rp/i.test(m.unit || '')) s += 2;
@@ -428,6 +484,15 @@ export function knownNumber(nums, v, scaled = true) {
 export function tableBrief(T, maxRows = 40) {
   const A = T.A, t = { head: T.head };
   const lines = [`${T.id} "${T.title}"${T.where ? ' (' + T.where + ')' : ''}: ${A.n} baris × ${T.head.length} kolom; kolom: ${T.head.map(h => short(h, 30)).join(' | ')}`];
+  if (A.kind === 'statement') {
+    const m = [...A.measures].sort((a, b) => imp(b) - imp(a))[0];
+    lines.push(`  • laporan bertingkat (bagian & baris jumlah): jangan menjumlahkan semua baris`);
+    for (const s of A.sections) {
+      const items = s.rows.filter(i => A.P[i][m.i]).slice(0, 14).map(i => `${short(A.rowLab[i] || '-', 50)} = ${fmtNum(A.P[i][m.i].v)}`);
+      if (items.length) lines.push(`  • ${s.name || mName(m)}: ${items.join('; ')}`);
+    }
+    return lines.join('\n');
+  }
   for (const m of A.measures.slice(0, 6)) {
     const s = m.st;
     if (!s.n) continue;

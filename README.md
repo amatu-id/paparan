@@ -6,6 +6,9 @@ https://amatu-id.github.io/paparan/ (aplikasi Portal AMATU).
 - **Belajar dokumen**: PDF (termasuk hasil scan, lewat OCR), Word (DOCX/ODT, DOC lama seadanya), Excel (XLSX/XLS/ODS/CSV),
   PowerPoint (PPTX/ODP, termasuk data grafik & catatan pembicara), gambar (OCR), teks/Markdown/HTML/JSON.
   Tabel direkonstruksi dari posisi teks PDF (tabel yang terpotong antarhalaman disambung), angka format Indonesia dibaca benar.
+  Screenshot tabel di dalam PDF/Word/PowerPoint dibaca lewat OCR: warna sel dijadikan latar, garis padat/titik-titik
+  dihapus dan dipakai sebagai batas kolom, baris kelompok (mis. PEMASUKKAN / PENGELUARAN) dikenali, dan bila dua
+  pembacaan berbeda dipilih yang jumlah kolomnya cocok dengan baris Total dokumen.
 - **Tanya jawab**: pencarian hibrida (BM25 + embedding bge-m3) → Gemma 4 menjawab hanya dari isi dokumen, dengan rujukan [n]
   yang bisa diklik (halaman PDF disorot, sel Excel ditandai). Bisa per dokumen atau semua dokumen.
 - **Paparan otomatis**: statistik tabel dihitung tanpa AI (total, rata-rata, target vs realisasi, tren, porsi, pareto),

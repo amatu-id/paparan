@@ -5,6 +5,33 @@ import { parseNum } from './numparse.js';
 const med = a => { if (!a.length) return 0; const s = [...a].sort((x, y) => x - y); return s[s.length >> 1]; };
 const isNumText = s => !!parseNum(String(s).replace(/\s+/g, ''), 'id') || /^[-–]$/.test(String(s).trim());
 const BULLET = /^([•●▪■◦○‣∙·►▶➢✓✔\-–*]|\(?[a-zA-Z0-9]{1,2}[.)])\s+/;
+const TOTAL = /^(\d{1,2}\s+)?(sub[\s-]?)?(total|jumlah|grand total)\b/i;
+// OCR slips in report headers: "Omazet" → "Omzet", "Makion" → "Maklon", "Target{m3)" → "Target (m3)", "‘SPH" → "SPH"
+const VOCAB = ['omzet', 'omset', 'target', 'realisasi', 'persentase', 'pencapaian', 'tonase', 'volume', 'tagihan', 'nominal', 'jumlah', 'total', 'bulan', 'tahun', 'periode', 'keterangan', 'maklon', 'terbayar', 'cicilan', 'piutang', 'penjualan', 'produksi', 'pembayaran', 'deposit', 'penawaran', 'profit', 'rincian', 'customer', 'tanggal', 'kubikasi', 'harga', 'satuan', 'biaya', 'pendapatan', 'saldo', 'hutang', 'pengeluaran', 'pemasukan', 'anggaran', 'selisih', 'minggu', 'order', 'surat', 'akhir', 'kuantitas', 'barang', 'pelanggan', 'proyek', 'lokasi', 'status', 'jenis', 'kategori', 'keuntungan', 'kerugian', 'penerimaan', 'pembelian', 'persediaan', 'stok'];
+const near1 = (a, b) => {
+  if (Math.abs(a.length - b.length) > 1) return false;
+  let i = 0, j = 0, e = 0;
+  while (i < a.length && j < b.length) {
+    if (a[i] === b[j]) { i++; j++; continue; }
+    if (++e > 1) return false;
+    if (a.length > b.length) i++; else if (b.length > a.length) j++; else { i++; j++; }
+  }
+  return e + (a.length - i) + (b.length - j) <= 1;
+};
+const fixWord = w => {
+  const lw = w.toLowerCase();
+  if (lw.length < 5 || VOCAB.includes(lw)) return w;
+  const hit = VOCAB.find(v => v.length >= 5 && near1(lw, v));
+  if (!hit) return w;
+  return w === w.toUpperCase() ? hit.toUpperCase() : w[0] === w[0].toUpperCase() ? hit[0].toUpperCase() + hit.slice(1) : hit;
+};
+const fixHead = h => String(h).replace(/^[‘’'`"]+|[‘’'`"]+$/g, '').replace(/\{/g, '(').replace(/\}/g, ')').replace(/([A-Za-z])\(/g, '$1 (').replace(/[A-Za-z][A-Za-z]{3,}/g, fixWord).replace(/\s+/g, ' ').trim();
+// formulas in labels read by OCR: "(S - 6)" → "(5 - 6)", "Komulatif 4-6 - 8)" → "Komulatif (4-6 - 8)"
+const fixFormula = s => s
+  .replace(/\(([\dSOIl\s+\-x×/.,]+)\)/g, (m, inner) => (/\d/.test(inner) && /[+\-x×/]/.test(inner) ? '(' + inner.replace(/S/g, '5').replace(/O/g, '0').replace(/[Il]/g, '1') + ')' : m))
+  .replace(/(^|\s)(\d+\s*[-+]\s*\d+(?:\s*[-+]\s*\d+)*)\)/g, '$1($2)');
+// words OCR glued together ("ProduksiSCPTempuran" → "Produksi SCP Tempuran")
+const unglue = s => (s.length >= 10 ? s.replace(/([a-z])([A-Z])/g, '$1 $2').replace(/([A-Z]{2,})([A-Z][a-z])/g, '$1 $2') : s);
 
 export function toLines(items, vlines = [], hlines = []) {
   // a table grid line between two words always separates them
@@ -53,7 +80,7 @@ export function toLines(items, vlines = [], hlines = []) {
     const segs = [];
     let cur = null;
     for (const it of L.items) {
-      const s = it.s.replace(/\s+/g, ' ');
+      const s = it.t0 != null ? unglue(it.s.replace(/\s+/g, ' ')) : it.s.replace(/\s+/g, ' ');
       if (!cur) { cur = { x0: it.x, x1: it.x + it.w, s, h: it.h, bold: it.b ? s.length : 0, n: s.length }; continue; }
       const gap = it.x - cur.x1, hh = Math.max(4, Math.min(cur.h, it.h));
       const numNext = /[\d%)]$/.test(cur.s.trim()) && /^[(\-–]?\s*(rp\.?\s*)?\d/i.test(s.trim());
@@ -66,7 +93,7 @@ export function toLines(items, vlines = [], hlines = []) {
       cur.n += s.length; if (it.b) cur.bold += s.length;
     }
     if (cur) segs.push(cur);
-    for (const g of segs) g.s = g.s.trim();
+    for (const g of segs) g.s = L.items[0]?.t0 != null ? fixFormula(unglue(g.s.trim())) : g.s.trim();
     // "Rp" left-aligned and the amount right-aligned in the same cell: one value, not two columns
     for (let k = 0; k < segs.length - 1; k++) {
       if (/^(rp\.?|idr|usd|us\$|\$|€|sgd)$/i.test(segs[k].s) && /^[(\-]?\s*\d/.test(segs[k + 1].s) && !(vlines.length && wall(segs[k].x1, segs[k + 1].x0, L.y, L.h))) {
@@ -108,7 +135,20 @@ function columnsOf(rows) {
     }
     if (cols.length < 2) return null;
   }
-  // rows with more segments than K can add columns in the gaps (sparse columns)
+  // rows with more segments than K add columns in the gaps (sparse columns): a header word over empty cells
+  // ("Keterangan"), or values that several rows put in the same gap
+  const gaps = [];
+  rows.forEach((r, ri) => {
+    if (r.segs.length <= K) return;
+    for (const g of r.segs) if (!cols.some(c => Math.min(c.x1, g.x1) - Math.max(c.x0, g.x0) > 0)) gaps.push({ g, head: ri < 3 && !/\d/.test(g.s) });
+  });
+  for (const { g, head } of gaps) {
+    if (cols.some(c => Math.min(c.x1, g.x1) - Math.max(c.x0, g.x0) > 0)) continue;
+    const same = gaps.filter(o => o.g !== g && Math.min(o.g.x1, g.x1) - Math.max(o.g.x0, g.x0) > 0).length;
+    if (!head && !same) continue;
+    cols.push({ x0: g.x0, x1: g.x1, sparse: 1 });
+    cols.sort((a, b) => a.x0 - b.x0);
+  }
   return cols;
 }
 function colIndex(cols, g) {
@@ -121,9 +161,50 @@ function colIndex(cols, g) {
   return best;
 }
 
+// A screenshot's own grid: vertical lines crossing most rows of the run are the column borders, and its top/bottom
+// border (a horizontal line across the grid just above/below) closes it. Rows outside and words beside it are not table.
+function gridOf(run, opt) {
+  const V = opt.vlines || [];
+  if (!opt.ocr || V.length < 3) return null;
+  const ys = run.map(r => r.y - r.h * 0.35);
+  const need = Math.max(2, Math.ceil(ys.length * 0.5));
+  const use = V.filter(v => ys.filter(y => y >= v.y0 - 3 && y <= v.y1 + 3).length >= need);
+  const X = [];
+  for (const x of use.map(v => v.x).sort((a, b) => a - b)) if (!X.length || x - X[X.length - 1] > 10) X.push(x);
+  if (X.length < 3) return null;
+  const xa = X[0], xb = X[X.length - 1], rowH = med(run.map(r => r.h));
+  let top = Math.min(...use.map(v => v.y0)), bot = Math.max(...use.map(v => v.y1));
+  const across = l => Math.min(l.x1, xb) - Math.max(l.x0, xa) >= (xb - xa) * 0.8;
+  const H = opt.grid?.hlines || [];
+  for (const l of [...H].sort((a, b) => b.y - a.y)) if (l.y < top && top - l.y <= rowH * 2.6 && across(l)) top = l.y;
+  for (const l of H) if (l.y > bot && l.y - bot <= rowH * 2.6 && across(l)) bot = l.y;
+  return { X, top, bot };
+}
+
 function buildTable(run, opt = {}) {
-  const cols = columnsOf(run);
+  let cols = columnsOf(run);
   if (!cols) return null;
+  // the grid decides the columns when it shows at least as many as most rows have cells
+  const G = gridOf(run, opt);
+  const before = [], after = [];
+  const cnt = {};
+  for (const r of run) if (r.segs.length >= 2) cnt[r.segs.length] = (cnt[r.segs.length] || 0) + 1;
+  const K = +Object.entries(cnt).sort((a, b) => b[1] - a[1] || b[0] - a[0])[0]?.[0] || 0;
+  if (G && G.X.length - 1 >= K) {
+    const inside = [];
+    for (const r of run) {
+      const yc = r.y - r.h * 0.35;
+      if (yc < G.top - 4) { before.push(r); continue; }
+      if (yc > G.bot + 4 && !(TOTAL.test(r.text) && r.segs.length >= 2 && yc - G.bot < r.h * 4)) { after.push(r); continue; }
+      const out = r.segs.filter(g => (g.x0 + g.x1) / 2 < G.X[0] - 4 || (g.x0 + g.x1) / 2 > G.X[G.X.length - 1] + 4);
+      for (const g of out) after.push({ ...r, segs: [g], x0: g.x0, x1: g.x1, text: g.s });
+      if (out.length === r.segs.length) continue;
+      inside.push(out.length ? { ...r, segs: r.segs.filter(g => !out.includes(g)) } : r);
+    }
+    if (inside.length < 2) return null;
+    run = inside;
+    cols = G.X.slice(1).map((x, k) => ({ x0: G.X[k], x1: x, grid: 1 }));
+  }
   const C = cols.length;
   const multi = run.filter(r => r.segs.length >= 2);
   const segs = multi.flatMap(r => r.segs);
@@ -142,40 +223,73 @@ function buildTable(run, opt = {}) {
     const punct = (x.match(/[.:,;'"`~=_\-—|·•]/g) || []).length;
     return x.length <= 3 || punct >= x.length * 0.5;
   };
+  // a section row ("PEMASUKKAN (CASH IN)"): one merged cell from the left edge across the column lines, no numbers
+  const section = (r, gap) => {
+    if (r.segs.length !== 1 || C < 2) return false;
+    const g = r.segs[0];
+    if (/\d/.test(g.s) || (g.s.match(/[a-z]/gi) || []).length < 3 || gap < r.h * 0.45) return false;
+    return g.x0 < cols[0].x1 && g.x1 > cols[1].x0 + r.h;
+  };
   for (const r of run) {
     if (opt.ocr && junk(r.text)) continue;
+    const gap = prev ? r.top - prev.bot : 99;
+    if (section(r, gap)) { rows.push({ c: [r.segs[0].s, ...Array(C - 1).fill('')], r: [r], group: true, sec: true }); prev = r; continue; }
     const cells = Array(C).fill('');
     for (const g of r.segs) { const j = colIndex(cols, g); cells[j] = cells[j] ? cells[j] + ' ' + g.s : g.s; }
     const filled = cells.filter(Boolean).length;
-    const gap = prev ? r.top - prev.bot : 99;
     // wrapped cell text: continues the row above (a row that fills most columns is a row of its own)
-    if (prev && gap < r.h * 0.9 && !cells[0] && filled <= Math.max(1, C * 0.35) && rows.length) {
+    if (prev && gap < r.h * 0.9 && !cells[0] && filled <= Math.max(1, C * 0.35) && rows.length && !rows[rows.length - 1].sec) {
       const last = rows[rows.length - 1];
       cells.forEach((c, j) => { if (c) last.c[j] = last.c[j] ? last.c[j] + ' ' + c : c; });
       last.r.push(r);
     } else rows.push({ c: cells, r: [r], group: filled === 1 && !!cells[0] && C > 2 });
     prev = r;
   }
-  // header rows: leading rows without numbers (max 3)
+  // header rows: leading rows without numbers (max 3); a section row after the header is data
   const numRow = row => { const n = row.c.slice(1).filter(c => c && isNumText(c)).length; return C >= 4 ? n >= 2 : n >= 1; };
   let nh = 0;
-  while (nh < rows.length - 1 && nh < 3 && !numRow(rows[nh])) nh++;
+  while (nh < rows.length - 1 && nh < 3 && !numRow(rows[nh]) && !(nh && rows[nh].sec)) nh++;
   if (nh === rows.length - 1 && nh > 1) nh = 1;
+  if (nh && rows[0].sec) nh = 0;
   let head;
   if (nh) {
     head = Array(C).fill('');
     for (let k = 0; k < nh; k++) rows[k].c.forEach((c, j) => { if (c) head[j] = head[j] ? head[j] + ' ' + c : c; });
     // a header cell spanning two columns leaves the next one empty: "Oktober" over "Target | Realisasi" stays in its own column
-    if (opt.ocr) head = head.map(h => h.replace(/\((?:96|9%|%6|36|26|%o)\)/g, '(%)').replace(/\b(\d{1,2})96\b/g, '$1%').replace(/\s+/g, ' ').trim());
+    if (opt.ocr) head = head.map(h => fixHead(h.replace(/\((?:96|9%|%6|36|26|%o)\)/g, '(%)').replace(/\b(\d{1,2})96\b/g, '$1%')));
   } else head = cols.map((_, j) => 'Kolom ' + (j + 1));
   const body = rows.slice(nh);
   if (!body.length) return null;
-  return { cols, head, rows: body.map(r => r.c), groups: body.map(r => r.group ? 1 : 0), lines: run, numRatio };
+  // OCR reads "%" as "96": "66.6396" in a column of percentages is 66.63%
+  if (opt.ocr) for (let j = 0; j < C; j++) {
+    const cells = body.filter(r => !r.sec && r.c[j]).map(r => r.c[j]);
+    if (cells.length < 2 || cells.filter(c => /%$/.test(c)).length < cells.length * 0.5) continue;
+    for (const r of body) if (r.c[j] && /^[-+]?\d{1,3}([.,]\d{1,2})?96$/.test(r.c[j]) && !/%/.test(r.c[j])) r.c[j] = r.c[j].replace(/96$/, '%');
+  }
+  // columns only a header word sits over (no value in any row) are left out
+  const keep = cols.map((c, j) => !(c.sparse || c.grid) || body.some(r => !r.sec && r.c[j]));
+  const pick = a => a.filter((_, j) => keep[j]);
+  return { cols: pick(cols), head: pick(head), rows: body.map(r => pick(r.c)), groups: body.map(r => r.group ? 1 : 0), lines: run, numRatio, before, after };
 }
 
 // ---------- page ----------
 export function pageBlocks(items, W, H, opt = {}) {
   const lines = toLines(items, opt.vlines || [], opt.hlines || []);
+  // two lines of a screenshot crossed by the same two (or more) vertical grid lines belong to one table
+  // (pieces of one border at the same x, broken where row lines cross it, count as one)
+  const V = [];
+  if (opt.ocr && (opt.vlines || []).length >= 2) {
+    const tol = Math.max(30, 0.8 * med(lines.map(L => L.h)));
+    for (const v of [...opt.vlines].filter(v => v.y1 - v.y0 > 40).sort((a, b) => a.x - b.x || a.y0 - b.y0)) {
+      const c = V.find(c => Math.abs(c.x - v.x) <= 6 && v.y0 <= c.y1 + tol);
+      if (c) c.y1 = Math.max(c.y1, v.y1); else V.push({ x: v.x, y0: v.y0, y1: v.y1 });
+    }
+  }
+  const inGrid = (A, B) => {
+    if (V.length < 2) return false;
+    const ya = A.y - A.h * 0.35, yb = B.y - B.h * 0.35, lo = Math.min(ya, yb), hi = Math.max(ya, yb);
+    return V.filter(v => v.y0 - 4 <= lo && v.y1 + 4 >= hi).length >= 2;
+  };
   if (!lines.length) return { blocks: [], tables: [] };
   let bodyH = med(lines.flatMap(L => Array(Math.min(20, Math.ceil(L.text.length / 20))).fill(Math.round(L.h * 2) / 2))) || 10;
   const out = [];   // {kind: 'line'|'table', ...} in reading order
@@ -186,9 +300,14 @@ export function pageBlocks(items, W, H, opt = {}) {
       let j = i + 1, singles = 0;
       while (j < lines.length) {
         const N = lines[j], gap = N.top - lines[j - 1].bot;
-        if (gap > 2.4 * Math.max(N.h, lines[j - 1].h)) break;
+        // rows inside one ruled grid stay together whatever OCR says about their height, and so does the
+        // total row right under it (often a merged, filled row without inner lines)
+        const grid = inGrid(lines[j - 1], N) || (opt.ocr && N.segs.length >= 2 && TOTAL.test(N.text));
+        if (gap > 2.4 * Math.max(N.h, lines[j - 1].h) && !grid) break;
+        // a title set bigger than the rows ("History Tagihan … 797.048.908") starts the next table
+        if (opt.ocr && j - i >= 2 && N.h > med(lines.slice(i, j).map(l => l.h)) * 1.35 && !grid) break;
         if (N.segs.length >= 2) singles = 0;
-        else if (++singles > 1 || N.h > bodyH * 1.35) break;
+        else if ((++singles > 1 || N.h > bodyH * 1.35) && !grid) break;
         j++;
       }
       while (j > i && lines[j - 1].segs.length < 2) j--;
@@ -204,14 +323,21 @@ export function pageBlocks(items, W, H, opt = {}) {
         for (const nl of [...left, ...right]) out.push({ kind: 'line', L: nl });
         i = j; continue;
       }
-      if (t) { out.push({ kind: 'table', t }); i = j; continue; }
+      if (t) {
+        for (const L2 of t.before || []) out.push({ kind: 'line', L: L2 });
+        out.push({ kind: 'table', t });
+        for (const L2 of t.after || []) out.push({ kind: 'line', L: L2 });
+        i = j; continue;
+      }
     }
     out.push({ kind: 'line', L });
     i++;
   }
-  // body text size from the lines outside tables (table cells are often set smaller)
+  // body text size from the lines outside tables (table cells are often set smaller) — but in a screenshot of a
+  // table the cells are the body and the free lines only its titles
   const free = out.filter(o => o.kind === 'line').map(o => o.L);
-  if (free.length) bodyH = med(free.flatMap(L => Array(Math.min(20, Math.ceil(L.text.length / 20))).fill(Math.round(L.h * 2) / 2))) || bodyH;
+  const freeLen = free.reduce((a, L) => a + L.text.length, 0), allLen = lines.reduce((a, L) => a + L.text.length, 0);
+  if (free.length && !(opt.grid && freeLen < allLen * 0.3)) bodyH = med(free.flatMap(L => Array(Math.min(20, Math.ceil(L.text.length / 20))).fill(Math.round(L.h * 2) / 2))) || bodyH;
   // paragraphs
   const sizes = [...new Set(free.filter(L => L.h > bodyH * 1.15).map(L => Math.round(L.h)))].sort((a, b) => b - a);
   const rect = L => [+(L.x0 / W).toFixed(4), +(L.top / H).toFixed(4), +((L.x1 - L.x0) / W).toFixed(4), +((L.bot - L.top) / H).toFixed(4)];
